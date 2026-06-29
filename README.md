@@ -1,5 +1,7 @@
 # Airflow on Azure Container Apps Jobs
 
+[![CI](https://github.com/hetvip2/airflow-on-aca-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/hetvip2/airflow-on-aca-jobs/actions/workflows/ci.yml)
+
 Run your existing **Apache Airflow** DAGs against **Azure Container Apps (ACA) Jobs**.
 Airflow stays where it already lives (your laptop, your cluster, Managed Airflow, Astronomer, …);
 a small operator tells ACA Jobs to run, then waits for the result.
@@ -70,6 +72,10 @@ The operator needs three values, supplied as Airflow **Variables**:
 In a real Airflow environment you'd set these once (UI → Admin → Variables, or
 `airflow variables set ...`) and copy `airflow/plugins/` and `airflow/dags/` into
 your Airflow. The local demo below does all of this for you.
+
+> Prefer not to use Variables? You can pass `subscription_id` / `resource_group` directly to
+> the operator, or store them in an Airflow **Connection** so DAGs need almost no inline
+> config — see [Authentication](#authentication).
 
 These are just the **defaults** — at trigger time a user can override the job name and
 pass their own workload arguments without touching code (see Step 4).
@@ -202,34 +208,122 @@ AIRFLOW__OPERATORS__DEFAULT_DEFERRABLE=true
   (the pipeline DAG uses `retries=2`). A failed ACA execution surfaces as a task failure,
   Airflow retries it, and downstream tasks are skipped on permanent failure.
 
-### Validated at scale
+### Validated end-to-end
 
-This was tested end-to-end against a live ACA Job with a real Airflow stack
-(LocalExecutor + Postgres + triggerer):
+Tested against a live ACA Job with a real Airflow stack (LocalExecutor + Postgres + triggerer):
 
-- **50 concurrent** deferrable executions: 50/50 succeeded, **0 throttling**.
-- **8-shard pipeline**: all shards deferred, ran in parallel, and succeeded on Azure.
+- **50 concurrent** deferrable executions: 50/50 succeeded, **0 throttling** observed.
+- **8-shard pipeline**: all shards deferred (worker slots freed), ran in parallel, and
+  succeeded on the Azure side.
 - **Retry recovery**: a deliberately failing execution was caught and automatically retried.
+
+> Scope of testing, stated honestly: the above used a single job in one subscription/region.
+> The architecture (deferrable + triggerer) is what enables much larger fan-out, but
+> throughput beyond ~50 concurrent and subscription-level ARM throttling limits haven't been
+> independently benchmarked. Tune `poll_interval_seconds`, executor parallelism, and DAG
+> `max_active_tasks` for your workload, and the operator's backoff will absorb throttling if
+> you hit it.
+
+---
+
+## Testing
+
+The repo ships an **offline** test suite (mocked ARM — no Azure account or network needed)
+plus a GitHub Actions workflow that lints and runs it on every push/PR.
+
+```bash
+pip install -r airflow/requirements.txt pytest ruff
+pytest          # 35 tests: auth resolution, retry/backoff, body building, trigger events
+ruff check airflow tests
+```
+
+> Airflow doesn't run on native Windows — run the tests in WSL2, Linux, macOS, or the
+> `apache/airflow` Docker image.
 
 ---
 
 ## Use it in your own Airflow
 
-1. Copy `airflow/plugins/` into your Airflow `plugins/` folder (gives you the operator
-   **and the async trigger**).
-2. Copy the DAGs you want from `airflow/dags/` into your `dags/` folder
+**1. Install the operator** — two interchangeable options:
+
+- *Copy the plugin* (simplest): copy `airflow/plugins/` into your Airflow `plugins/` folder
+  (gives you the operator **and the async trigger**).
+- *Or pip-install it* into your Airflow image:
+  ```bash
+  pip install "git+https://github.com/hetvip2/airflow-on-aca-jobs"
+  ```
+  Both expose the same `operators` / `triggers` modules the DAGs import.
+
+**2. Add the DAGs** you want from `airflow/dags/` into your `dags/` folder
    (`aca_jobs_example_dag.py` for single jobs, `aca_jobs_pipeline_dag.py` for pipelines).
-3. Install the requirements on your Airflow workers: `pip install -r airflow/requirements.txt`.
-4. Make sure Airflow can reach Azure — either an attached **Managed Identity / Service
-   Principal** (the operator uses `DefaultAzureCredential`) or the `AZURE_ACCESS_TOKEN`
-   env var. Grant that identity access to the job:
-   ```bash
-   az role assignment create --assignee <identity-id> --role Contributor \
-     --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.App/jobs/<job>
-   ```
-5. For `deferrable=True` (recommended at scale), make sure a **triggerer** is running and
-   you use a concurrent executor — see [Step 5](#step-5--production-scale-pipelines-deferral--retries).
-6. Set the three Airflow Variables from Step 2 and trigger the DAG.
+
+**3. Install the requirements** on your workers (skip if you pip-installed above):
+   `pip install -r airflow/requirements.txt`.
+
+**4. Connect Airflow to Azure** — see [Authentication](#authentication) below. The easy,
+   portable path is a single Airflow **Connection**; it works the same whether your Airflow
+   runs on Azure, AWS, or on-prem.
+
+**5. For scale**, run a **triggerer** and a concurrent executor so `deferrable=True` works —
+   see [Step 5](#step-5--production-scale-pipelines-deferral--retries).
+
+---
+
+## Authentication
+
+The operator needs an Azure AD identity that can start your job. Pick whichever fits your
+Airflow — the operator tries them in this order:
+
+### Option A — Airflow Connection (recommended, works anywhere)
+
+Create one Connection and point the operator at it with `azure_conn_id`. This is the easiest
+path for **any** Airflow, including off-Azure (AWS, on-prem, Astronomer).
+
+```bash
+airflow connections add azure_default \
+  --conn-type generic \
+  --conn-login "<client-id>" \
+  --conn-password "<client-secret>" \
+  --conn-extra '{"tenant_id":"<tenant-id>","subscription_id":"<sub>","resource_group":"<rg>"}'
+```
+
+```python
+AzureContainerAppsJobOperator(
+    task_id="run_job",
+    azure_conn_id="azure_default",   # auth comes from the connection
+    job_name="my-job",               # sub + rg can live in the connection extra
+    deferrable=True,
+)
+```
+
+The connection's `extra` understands: `tenant_id`, `client_id`/`client_secret` (or use
+login/password), `access_token` (a pre-fetched ARM token), `managed_identity_client_id`,
+and optional `subscription_id` / `resource_group` defaults so your DAGs stay tiny.
+
+### Option B — Managed identity (best on Azure-hosted Airflow)
+
+If Airflow runs on Azure with a managed identity attached, set **nothing** — the operator
+uses `DefaultAzureCredential` automatically. For a **user-assigned** identity, pass its
+client id:
+
+```python
+AzureContainerAppsJobOperator(task_id="run_job", job_name="my-job",
+                              managed_identity_client_id="<user-assigned-mi-client-id>")
+```
+
+### Option C — Pre-fetched token (demo / quick tests only)
+
+Set `AZURE_ACCESS_TOKEN` to a short-lived ARM token (this is what the local demo uses).
+Not for production: it doesn't auto-refresh, so long deferred polls will stall when it expires.
+
+**Grant the identity access to the job** (any option):
+```bash
+az role assignment create --assignee <identity-or-client-id> --role Contributor \
+  --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.App/jobs/<job>
+```
+
+> You can scope this more tightly than `Contributor` to just the job's start/read actions
+> with a custom role if your security posture requires least privilege.
 
 ---
 
@@ -246,6 +340,7 @@ azd down
 ```
 airflow-on-aca-jobs/
 ├── azure.yaml                 # Azure Developer CLI (azd) config
+├── pyproject.toml             # packaging + pytest/ruff config (pip-installable)
 ├── infra/                     # Bicep: ACA environment + Job (+ tier add-ons)
 │   ├── main.bicep
 │   ├── main.parameters.json
@@ -256,6 +351,8 @@ airflow-on-aca-jobs/
 │   │   ├── operators/         # AzureContainerAppsJobOperator (+ shared HTTP/auth helpers)
 │   │   └── triggers/          # async trigger for deferrable mode
 │   └── requirements.txt
+├── tests/                     # offline test suite (mocked ARM, no Azure needed)
+├── .github/workflows/ci.yml   # lint + tests on every push / PR
 └── demo/                      # one-command local demo (Docker)
     ├── run-demo.ps1
     └── run-demo.sh
@@ -266,11 +363,12 @@ airflow-on-aca-jobs/
 | Symptom | Fix |
 |---------|-----|
 | `azd up` fails with `AKSCapacityHeavyUsage` | Region is temporarily full. `azd env set AZURE_LOCATION <other-region>` and retry. |
-| `401`/`403` when the DAG runs | The Azure identity can't reach the job. Re-check the `az role assignment` in "Use it in your own Airflow". |
+| `401`/`403` when the DAG runs | The Azure identity can't reach the job. Re-check the `az role assignment` in [Authentication](#authentication). |
+| `DefaultAzureCredential failed to retrieve a token` | No ambient identity. Use an Airflow **Connection** (Option A) or attach a managed identity. |
 | Demo says Docker not found | Install Docker Desktop and make sure it's running. |
 | Airflow fails with `ModuleNotFoundError: fcntl` | You're running Airflow on native Windows. Use the Docker demo (Step 3) or WSL2. |
 | Task times out | Your job runs longer than the operator waits. Raise `execution_timeout_seconds` in the DAG. |
-| Deferrable task never resumes / stuck in `deferred` | No **triggerer** is running (`airflow triggerer`), or auth is a static `AZURE_ACCESS_TOKEN` that expired mid-poll. Run a triggerer and use Managed Identity for long jobs. |
+| Deferrable task never resumes / stuck in `deferred` | No **triggerer** is running (`airflow triggerer`), or auth is a static `AZURE_ACCESS_TOKEN` that expired mid-poll. Run a triggerer and use a Connection or Managed Identity for long jobs. |
 | Fan-out tasks run one at a time | You're on the Sequential executor (the demo). Use Local, Celery, or Kubernetes executor for parallelism. |
 
 ## License

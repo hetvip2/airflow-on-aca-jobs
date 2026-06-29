@@ -11,12 +11,12 @@ import json
 import os
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 import requests
 from airflow.exceptions import AirflowException
-
 
 DEFAULT_API_VERSION = "2024-03-01"
 
@@ -58,7 +58,7 @@ class ACAJobRef:
         }
 
     @staticmethod
-    def from_dict(data: Mapping[str, str]) -> "ACAJobRef":
+    def from_dict(data: Mapping[str, str]) -> ACAJobRef:
         return ACAJobRef(
             subscription_id=data["subscription_id"],
             resource_group=data["resource_group"],
@@ -66,7 +66,7 @@ class ACAJobRef:
         )
 
     @staticmethod
-    def from_resource_id(resource_id: str) -> "ACAJobRef":
+    def from_resource_id(resource_id: str) -> ACAJobRef:
         pattern = (
             r"^/subscriptions/(?P<subscription_id>[^/]+)/resourceGroups/"
             r"(?P<resource_group>[^/]+)/providers/Microsoft\.App/jobs/"
@@ -94,20 +94,145 @@ def headers(token: str) -> dict[str, str]:
     }
 
 
-def get_token(log: Any = None) -> str:
-    # Demo/dev fallback: use a pre-fetched ARM token if provided. Avoids needing
-    # azure-identity in constrained environments. The token is short-lived (~1h).
+ARM_SCOPE = "https://management.azure.com/.default"
+
+
+def get_token(auth: Mapping[str, Any] | None = None, log: Any = None) -> str:
+    """Return an ARM bearer token using whatever auth the customer configured.
+
+    Resolution order (first match wins):
+
+    1. **Airflow Connection** (``auth["conn_id"]``) — the easy, portable path that
+       works in *any* Airflow (Azure, AWS, on-prem). The connection can hold a
+       service principal (client id/secret/tenant), a pre-fetched ``access_token``,
+       or a user-assigned managed identity client id. See ``token_from_connection``.
+    2. **Pre-fetched token** in the ``AZURE_ACCESS_TOKEN`` env var (handy for the
+       local demo / quick tests; short-lived ~1h).
+    3. **Ambient credentials** via ``DefaultAzureCredential`` (managed identity,
+       ``AZURE_*`` env vars, az login, …). Pass ``managed_identity_client_id`` to
+       select a specific user-assigned identity.
+    """
+    auth = dict(auth or {})
+    conn_id = auth.get("conn_id")
+    managed_identity_client_id = auth.get("managed_identity_client_id")
+
+    if conn_id:
+        if log:
+            log.info("Authenticating to Azure via Airflow connection '%s'.", conn_id)
+        return token_from_connection(conn_id, managed_identity_client_id, log)
+
     env_token = os.environ.get("AZURE_ACCESS_TOKEN")
     if env_token:
         if log:
             log.info("Using ARM token from AZURE_ACCESS_TOKEN environment variable.")
         return env_token
 
+    if log:
+        log.info("Authenticating to Azure via DefaultAzureCredential.")
+    return _default_credential_token(managed_identity_client_id)
+
+
+def token_from_connection(
+    conn_id: str,
+    managed_identity_client_id: str | None = None,
+    log: Any = None,
+) -> str:
+    """Mint an ARM token from an Airflow Connection.
+
+    Recognised fields (login/password or matching keys in the JSON *extra*):
+
+    | Purpose                         | Connection field |
+    |---------------------------------|------------------|
+    | Service principal client id     | ``login`` (or extra ``client_id``) |
+    | Service principal client secret | ``password`` (or extra ``client_secret``) |
+    | Azure AD tenant id              | extra ``tenant_id`` |
+    | Pre-fetched ARM token           | extra ``access_token`` |
+    | User-assigned MI client id      | extra ``managed_identity_client_id`` |
+
+    Tenant/subscription/resource-group can also be stored in the extra so DAGs
+    need even less inline config (see ``connection_defaults``).
+    """
+    from airflow.hooks.base import BaseHook
+
+    conn = BaseHook.get_connection(conn_id)
+    extra = _conn_extra(conn)
+
+    access_token = extra.get("access_token")
+    if access_token:
+        return str(access_token)
+
+    client_id = conn.login or extra.get("client_id") or extra.get("clientId")
+    client_secret = conn.password or extra.get("client_secret") or extra.get("clientSecret")
+    tenant_id = extra.get("tenant_id") or extra.get("tenantId")
+    mi_client_id = (
+        managed_identity_client_id
+        or extra.get("managed_identity_client_id")
+        or extra.get("managedIdentityClientId")
+    )
+
+    if client_id and client_secret and tenant_id:
+        from azure.identity import ClientSecretCredential
+
+        credential = ClientSecretCredential(
+            tenant_id=str(tenant_id),
+            client_id=str(client_id),
+            client_secret=str(client_secret),
+        )
+        return credential.get_token(ARM_SCOPE).token
+
+    # No full service principal in the connection: fall back to ambient creds,
+    # honoring a user-assigned managed identity if one was supplied.
+    if log:
+        log.info(
+            "Connection '%s' has no full service principal; using "
+            "DefaultAzureCredential.",
+            conn_id,
+        )
+    return _default_credential_token(mi_client_id or client_id)
+
+
+def connection_defaults(conn_id: str | None) -> dict[str, str]:
+    """Pull optional subscription_id/resource_group defaults from a connection.
+
+    Lets customers store these once in the connection's *extra* instead of
+    repeating them in every DAG. Returns an empty dict when unavailable.
+    """
+    if not conn_id:
+        return {}
+    try:
+        from airflow.hooks.base import BaseHook
+
+        extra = _conn_extra(BaseHook.get_connection(conn_id))
+    except Exception:  # pragma: no cover - connection missing/unreadable
+        return {}
+    out: dict[str, str] = {}
+    for key in ("subscription_id", "subscriptionId"):
+        if extra.get(key):
+            out["subscription_id"] = str(extra[key])
+            break
+    for key in ("resource_group", "resourceGroup"):
+        if extra.get(key):
+            out["resource_group"] = str(extra[key])
+            break
+    return out
+
+
+def _conn_extra(conn: Any) -> dict[str, Any]:
+    try:
+        extra = conn.extra_dejson
+        return dict(extra) if isinstance(extra, dict) else {}
+    except Exception:  # pragma: no cover - malformed extra
+        return {}
+
+
+def _default_credential_token(managed_identity_client_id: str | None = None) -> str:
     from azure.identity import DefaultAzureCredential
 
-    credential = DefaultAzureCredential()
-    access_token = credential.get_token("https://management.azure.com/.default")
-    return access_token.token
+    kwargs: dict[str, Any] = {}
+    if managed_identity_client_id:
+        kwargs["managed_identity_client_id"] = str(managed_identity_client_id)
+    credential = DefaultAzureCredential(**kwargs)
+    return credential.get_token(ARM_SCOPE).token
 
 
 def request_with_retry(

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
@@ -31,6 +32,7 @@ class AzureContainerAppsJobTrigger(BaseTrigger):
         api_version: str = aca.DEFAULT_API_VERSION,
         poll_interval_seconds: int = 15,
         timeout_seconds: int = 60 * 60,
+        auth: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.job_ref = job_ref
@@ -38,6 +40,7 @@ class AzureContainerAppsJobTrigger(BaseTrigger):
         self.api_version = api_version
         self.poll_interval_seconds = poll_interval_seconds
         self.timeout_seconds = timeout_seconds
+        self.auth = auth or {}
 
     def serialize(self) -> tuple[str, dict[str, Any]]:
         return (
@@ -48,12 +51,13 @@ class AzureContainerAppsJobTrigger(BaseTrigger):
                 "api_version": self.api_version,
                 "poll_interval_seconds": self.poll_interval_seconds,
                 "timeout_seconds": self.timeout_seconds,
+                "auth": self.auth,
             },
         )
 
     async def run(self) -> AsyncIterator[TriggerEvent]:
         job_ref = aca.ACAJobRef.from_dict(self.job_ref)
-        token = await asyncio.to_thread(aca.get_token, None)
+        token = await asyncio.to_thread(aca.get_token, self.auth, None)
         deadline = time.monotonic() + self.timeout_seconds
 
         while True:
@@ -81,7 +85,7 @@ class AzureContainerAppsJobTrigger(BaseTrigger):
                 )
             except aca.ACATokenExpired:
                 # Long jobs can outlive the ARM token; refresh and keep polling.
-                token = await asyncio.to_thread(aca.get_token, None)
+                token = await asyncio.to_thread(aca.get_token, self.auth, None)
                 continue
 
             if state in aca.TERMINAL_SUCCESS:

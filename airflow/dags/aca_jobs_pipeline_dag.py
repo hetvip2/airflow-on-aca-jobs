@@ -64,6 +64,7 @@ with DAG(
         subscription_id="{{ var.value.azure_subscription_id }}",
         resource_group="{{ var.value.aca_resource_group }}",
         job_name="{{ var.value.aca_job_name }}",
+        azure_conn_id="{{ var.value.get('azure_conn_id', '') }}",
         deferrable=True,
         poll_interval_seconds=15,
         execution_timeout_seconds=3600,

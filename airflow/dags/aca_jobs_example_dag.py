@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from airflow import DAG
 from airflow.models.param import Param
+
+from airflow import DAG
 
 try:
     # In a real Airflow deployment the `plugins/` directory is on sys.path,
@@ -72,8 +73,7 @@ with DAG(
         command="{{ params.command }}",
         args="{{ params.args }}",
         env_vars="{{ params.env }}",
+        azure_conn_id="{{ var.value.get('azure_conn_id', '') }}",
         poll_interval_seconds=15,
         execution_timeout_seconds=3600,
     )
-
-    run_aca_job

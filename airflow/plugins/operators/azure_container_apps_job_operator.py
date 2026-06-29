@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
@@ -42,6 +43,15 @@ class AzureContainerAppsJobOperator(BaseOperator):
     the operator starts the execution, then defers polling to Airflow's async
     triggerer. This is what lets one Airflow deployment orchestrate thousands of
     concurrent ACA Job executions without pinning a worker per job.
+
+    **Authentication.** The easiest, most portable option is ``azure_conn_id``,
+    pointing at an Airflow Connection that holds a service principal
+    (client id/secret/tenant) or a user-assigned managed identity client id. This
+    works in any Airflow — Azure, AWS, or on-prem. If you omit it, the operator
+    falls back to the ``AZURE_ACCESS_TOKEN`` env var (demo) and then to
+    ``DefaultAzureCredential`` (managed identity / az login). ``subscription_id``
+    and ``resource_group`` may also be stored in the connection's *extra* so DAGs
+    need even less inline config.
     """
 
     template_fields = (
@@ -56,6 +66,8 @@ class AzureContainerAppsJobOperator(BaseOperator):
         "env_vars",
         "cpu",
         "memory",
+        "azure_conn_id",
+        "managed_identity_client_id",
     )
 
     def __init__(
@@ -76,6 +88,8 @@ class AzureContainerAppsJobOperator(BaseOperator):
         poll_interval_seconds: int = 15,
         execution_timeout_seconds: int = 60 * 60,
         deferrable: bool | None = None,
+        azure_conn_id: str | None = None,
+        managed_identity_client_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -94,10 +108,20 @@ class AzureContainerAppsJobOperator(BaseOperator):
         self.poll_interval_seconds = poll_interval_seconds
         self.execution_timeout_seconds = execution_timeout_seconds
         self.deferrable = _default_deferrable() if deferrable is None else deferrable
+        self.azure_conn_id = azure_conn_id
+        self.managed_identity_client_id = managed_identity_client_id
+
+    def _auth(self) -> dict[str, Any]:
+        """Serializable auth config shared by the operator and its trigger."""
+        return {
+            "conn_id": self.azure_conn_id,
+            "managed_identity_client_id": self.managed_identity_client_id,
+        }
 
     def execute(self, context: dict[str, Any]) -> str:
         job_ref = self._resolve_job_ref()
-        token = aca.get_token(self.log)
+        auth = self._auth()
+        token = aca.get_token(auth, self.log)
         start_body = self._build_start_body(job_ref, token)
         execution_name = aca.start_execution(
             job_ref, token, start_body, self.api_version, self.log
@@ -111,6 +135,7 @@ class AzureContainerAppsJobOperator(BaseOperator):
                     api_version=self.api_version,
                     poll_interval_seconds=self.poll_interval_seconds,
                     timeout_seconds=self.execution_timeout_seconds,
+                    auth=auth,
                 ),
                 method_name="execute_complete",
             )
@@ -136,13 +161,24 @@ class AzureContainerAppsJobOperator(BaseOperator):
     def _resolve_job_ref(self) -> aca.ACAJobRef:
         if self.job_resource_id:
             return aca.ACAJobRef.from_resource_id(self.job_resource_id)
-        if not (self.subscription_id and self.resource_group and self.job_name):
+
+        subscription_id = self.subscription_id
+        resource_group = self.resource_group
+        if not (subscription_id and resource_group):
+            # Allow customers to store these once in the connection's extra.
+            defaults = aca.connection_defaults(self.azure_conn_id)
+            subscription_id = subscription_id or defaults.get("subscription_id")
+            resource_group = resource_group or defaults.get("resource_group")
+
+        if not (subscription_id and resource_group and self.job_name):
             raise AirflowException(
-                "Provide either job_resource_id or subscription_id + resource_group + job_name."
+                "Provide either job_resource_id or subscription_id + resource_group "
+                "+ job_name (subscription_id/resource_group may also come from the "
+                "Airflow connection's extra)."
             )
         return aca.ACAJobRef(
-            subscription_id=self.subscription_id,
-            resource_group=self.resource_group,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
             job_name=self.job_name,
         )
 
@@ -247,7 +283,7 @@ class AzureContainerAppsJobOperator(BaseOperator):
                     job_ref, execution_name, token, self.api_version, self.log
                 )
             except aca.ACATokenExpired:
-                token = aca.get_token(self.log)
+                token = aca.get_token(self._auth(), self.log)
                 continue
 
             if state in aca.TERMINAL_SUCCESS:

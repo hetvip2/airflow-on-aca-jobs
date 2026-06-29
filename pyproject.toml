@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airflow-on-aca-jobs"
+version = "0.1.0"
+description = "Run Apache Airflow DAGs against Azure Container Apps Jobs - host-nothing operator with deferrable execution, retries, and parallel fan-out."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Hetvi Patel" }]
+keywords = ["airflow", "azure", "container-apps", "aca", "jobs", "orchestration"]
+dependencies = [
+    "apache-airflow>=2.8.0",
+    "azure-identity>=1.16.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/hetvip2/airflow-on-aca-jobs"
+Repository = "https://github.com/hetvip2/airflow-on-aca-jobs"
+
+# The runtime artifact is the Airflow plugins folder. Mapping it here means
+# `pip install .` (or `pip install "git+https://github.com/hetvip2/airflow-on-aca-jobs"`)
+# installs the same `operators` / `triggers` modules the DAGs import - so the
+# copy-the-folder and pip-install paths are interchangeable.
+[tool.setuptools]
+package-dir = { "" = "airflow/plugins" }
+
+[tool.setuptools.packages.find]
+where = ["airflow/plugins"]
+include = ["operators*", "triggers*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["airflow/plugins"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
