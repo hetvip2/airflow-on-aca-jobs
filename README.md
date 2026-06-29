@@ -18,6 +18,44 @@ database to run — Airflow is the brain, ACA Jobs is the worker.
 
 ---
 
+## Quickstart
+
+Get from zero to "Airflow ran my ACA Job" in three commands. Assumes you've
+installed the [prerequisites](#prerequisites) (`az`, `azd`, Docker) and run
+`az login` + `azd auth login`.
+
+```bash
+# 1. Deploy the ACA Job to Azure (pick the "try" tier when prompted)
+azd env new my-airflow-aca && azd up
+
+# 2. Run the local demo — starts Airflow in Docker, wires in your job, runs the DAG.
+#    Use the resource group + job name that `azd up` printed.
+#    macOS / Linux:
+./demo/run-demo.sh <resource-group> <job-name>
+#    Windows (PowerShell):
+./demo/run-demo.ps1 -ResourceGroup <resource-group> -JobName <job-name>
+
+# 3. Done — you'll see "SUCCESS: Airflow orchestrated your ACA Job end-to-end."
+#    Open http://localhost:8080 (user: admin) to view the run, then clean up:
+docker rm -f airflow-aca-demo
+```
+
+**No Azure account yet, or just want to see the code run?** The offline test
+suite needs neither Azure nor network:
+
+```bash
+pip install -r airflow/requirements.txt pytest ruff && pytest
+```
+
+**Already run Airflow?** Skip the demo — copy `airflow/plugins/` and
+`airflow/dags/` into your Airflow (or `pip install "git+https://github.com/hetvip2/airflow-on-aca-jobs"`),
+set three Variables, and trigger the DAG. See [Use it in your own Airflow](#use-it-in-your-own-airflow).
+
+> Each step is explained in full below (deploy → wire up → demo → run any
+> workload → scale). The Quickstart is just the fast path.
+
+---
+
 ## What you get
 
 | Tier | Best for | Adds on top of `try` |
