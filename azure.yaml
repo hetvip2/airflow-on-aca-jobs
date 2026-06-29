@@ -1,0 +1,14 @@
+name: airflow-on-aca-jobs
+metadata:
+  template: airflow-on-aca-jobs@0.1.0-beta
+
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      run: ./infra/scripts/select-tier.sh
+      interactive: true
+    windows:
+      shell: pwsh
+      run: ./infra/scripts/select-tier.ps1
+      interactive: true

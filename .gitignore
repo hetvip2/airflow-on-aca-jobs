@@ -1,0 +1,10 @@
+# azd
+.azure/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local demo / Airflow runtime
+.venv-airflow/
+.airflow-home/
